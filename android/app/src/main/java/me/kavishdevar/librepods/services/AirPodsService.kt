@@ -883,7 +883,9 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
                 if (batteryNotification.getBattery()[0].status == BatteryStatus.CHARGING && batteryNotification.getBattery()[1].status == BatteryStatus.CHARGING) {
                     disconnectAudio(this@AirPodsService, device)
                 } else {
-                    connectAudio(this@AirPodsService, device)
+                    // Battery packets arrive often (e.g. every time the AirPods (re)open HFP),
+                    // so only reconnect audio if it is actually disconnected.
+                    connectAudio(this@AirPodsService, device, skipIfConnected = true)
                 }
             }
 
@@ -3010,43 +3012,48 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
         }
     }
 
-    fun connectAudio(context: Context, device: BluetoothDevice?) {
+    /**
+     * Connects A2DP (and HFP, when permitted) to [device].
+     *
+     * With [skipIfConnected], a profile that is already connected to [device] is left alone,
+     * so frequent callers (such as battery updates) don't keep issuing connect requests.
+     * Profile proxies are always closed again, whichever branch is taken.
+     */
+    fun connectAudio(context: Context, device: BluetoothDevice?, skipIfConnected: Boolean = false) {
         val bluetoothAdapter = context.getSystemService(BluetoothManager::class.java).adapter
 
         bluetoothAdapter?.getProfileProxy(context, object : BluetoothProfile.ServiceListener {
             override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
-                if (profile == BluetoothProfile.A2DP) {
-                    if (context.checkSelfPermission("android.permission.BLUETOOTH_PRIVILEGED") == PackageManager.PERMISSION_GRANTED) {
-                        try {
-                            val policyMethod = proxy.javaClass.getMethod(
-                                "setConnectionPolicy",
-                                BluetoothDevice::class.java,
-                                Int::class.java
-                            )
-                            Log.d(TAG, "calling A2DP.setConnectionPolicy for ${device?.address} to 100")
-                            policyMethod.invoke(proxy, device, 100)
-
-                            val connectMethod =
-                                proxy.javaClass.getMethod("connect", BluetoothDevice::class.java)
-                            connectMethod.invoke(
-                                proxy, device
-                            )
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                        } finally {
-                            bluetoothAdapter.closeProfileProxy(BluetoothProfile.A2DP, proxy)
-                            if (MediaController.pausedWhileTakingOver) {
-                                MediaController.sendPlay()
-                            }
-                        }
+                if (profile != BluetoothProfile.A2DP) return
+                val privileged = context.checkSelfPermission("android.permission.BLUETOOTH_PRIVILEGED") == PackageManager.PERMISSION_GRANTED
+                try {
+                    if (skipIfConnected && device != null &&
+                        proxy.getConnectionState(device) == BluetoothProfile.STATE_CONNECTED
+                    ) {
+                        Log.d(TAG, "A2DP already connected to ${device.address}, not reconnecting")
+                        return
                     }
-                    else {
-                        val connectMethod =
-                            proxy.javaClass.getMethod("connect", BluetoothDevice::class.java)
-                        connectMethod.invoke(
-                            proxy, device
+                    if (privileged) {
+                        val policyMethod = proxy.javaClass.getMethod(
+                            "setConnectionPolicy",
+                            BluetoothDevice::class.java,
+                            Int::class.java
                         )
+                        Log.d(TAG, "calling A2DP.setConnectionPolicy for ${device?.address} to 100")
+                        policyMethod.invoke(proxy, device, 100)
+                    }
+                    val connectMethod =
+                        proxy.javaClass.getMethod("connect", BluetoothDevice::class.java)
+                    connectMethod.invoke(proxy, device)
+                    if (!privileged) {
                         Log.d(TAG, "not setting connection policy for A2DP, no BLUETOOTH_PRIVILEGED permission. just called connect")
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                } finally {
+                    bluetoothAdapter.closeProfileProxy(BluetoothProfile.A2DP, proxy)
+                    if (privileged && MediaController.pausedWhileTakingOver) {
+                        MediaController.sendPlay()
                     }
                 }
             }
@@ -3056,30 +3063,35 @@ class AirPodsService : Service(), SharedPreferences.OnSharedPreferenceChangeList
 
         bluetoothAdapter?.getProfileProxy(context, object : BluetoothProfile.ServiceListener {
             override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
-                if (profile == BluetoothProfile.HEADSET) {
-                    if (checkSelfPermission("android.permission.MODIFY_PHONE_STATE") == PackageManager.PERMISSION_GRANTED) {
-                        try {
-                            val policyMethod = proxy.javaClass.getMethod(
-                                "setConnectionPolicy",
-                                BluetoothDevice::class.java,
-                                Int::class.java
-                            )
-                            Log.d(
-                                TAG,
-                                "calling HEADSET.setConnectionPolicy for ${device?.address} to 100"
-                            )
-                            policyMethod.invoke(proxy, device, 100)
-                            val connectMethod =
-                                proxy.javaClass.getMethod("connect", BluetoothDevice::class.java)
-                            connectMethod.invoke(proxy, device)
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                        } finally {
-                            bluetoothAdapter.closeProfileProxy(BluetoothProfile.HEADSET, proxy)
-                        }
-                    } else {
+                if (profile != BluetoothProfile.HEADSET) return
+                try {
+                    if (checkSelfPermission("android.permission.MODIFY_PHONE_STATE") != PackageManager.PERMISSION_GRANTED) {
                         Log.d(TAG, "not setting connection policy for HEADSET, no MODIFIY_PHONE_STATE permission")
+                        return
                     }
+                    if (skipIfConnected && device != null &&
+                        proxy.getConnectionState(device) == BluetoothProfile.STATE_CONNECTED
+                    ) {
+                        Log.d(TAG, "HEADSET already connected to ${device.address}, not reconnecting")
+                        return
+                    }
+                    val policyMethod = proxy.javaClass.getMethod(
+                        "setConnectionPolicy",
+                        BluetoothDevice::class.java,
+                        Int::class.java
+                    )
+                    Log.d(
+                        TAG,
+                        "calling HEADSET.setConnectionPolicy for ${device?.address} to 100"
+                    )
+                    policyMethod.invoke(proxy, device, 100)
+                    val connectMethod =
+                        proxy.javaClass.getMethod("connect", BluetoothDevice::class.java)
+                    connectMethod.invoke(proxy, device)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                } finally {
+                    bluetoothAdapter.closeProfileProxy(BluetoothProfile.HEADSET, proxy)
                 }
             }
 
